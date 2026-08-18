@@ -1,4 +1,4 @@
-import { serverEnv } from './env.ts'
+import { serverEnv } from './env.js'
 
 export type AppsScriptResponse = {
   ok?: boolean

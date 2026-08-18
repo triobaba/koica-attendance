@@ -1,6 +1,10 @@
-import { getActiveProgramme } from '../src/schedule.ts'
-import { callAppsScript, jsonResponse } from '../lib/apps-script.ts'
-import { serverEnv } from '../lib/env.ts'
+import { getActiveProgramme } from '../src/schedule.js'
+import { callAppsScript, jsonResponse } from '../lib/apps-script.js'
+import { serverEnv } from '../lib/env.js'
+
+// #region agent log
+fetch('http://127.0.0.1:7340/ingest/5d4c122e-e010-454f-b4af-74372fe873f8',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'e1c2be'},body:JSON.stringify({sessionId:'e1c2be',runId:'post-fix',hypothesisId:'H2',location:'api/checkin-access.ts:1',message:'checkin-access module loaded, schedule import resolved',data:{hasGetActiveProgramme:typeof getActiveProgramme==='function',hasCallAppsScript:typeof callAppsScript==='function'},timestamp:Date.now()})}).catch(()=>{});
+// #endregion
 
 const defaultProgramPin = () => serverEnv('VITE_PROGRAM_PIN', '1234')
 const staffPin = () => serverEnv('STAFF_PIN', serverEnv('VITE_STAFF_PIN', '5678'))

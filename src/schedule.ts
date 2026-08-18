@@ -1,4 +1,4 @@
-import type { Programme } from './types.ts'
+import type { Programme } from './types.js'
 
 // Source: https://serene-sawine-f5fe79.netlify.app/koica-schedule.ics
 // Check-in programmes only (meals, free days, arrival, and departure omitted).
