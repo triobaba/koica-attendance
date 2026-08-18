@@ -141,6 +141,13 @@ function App() {
     setStatusMessage('Hold your pass in the frame. Scanning starts automatically.')
   }
 
+  const rescan = () => {
+    scannedRef.current = null
+    setScanned(null)
+    setStatusKind('info')
+    setStatusMessage('Hold your pass in the frame. Scanning starts automatically.')
+  }
+
   // Every terminal state, good or bad, parks on a message and then hands the
   // device back to the next attendee at the PIN screen.
   const finishWith = (next: FlowOutcome) => {
@@ -540,58 +547,73 @@ function App() {
           </article>
         ) : (
           <>
-            <article className="card">
-              <h2>Self Check-in</h2>
-              <p>
-                {activeProgramme
-                  ? `Hold the pass in the frame. Checking in for ${activeProgramme.title} (${formatProgrammeWindow(activeProgramme)}).`
-                  : 'Hold the pass in the frame.'}
-              </p>
-              <div className="camera-wrap">
+            {/* Kept mounted while confirming so returning to the camera is instant. */}
+            <section className={scanned ? 'step is-hidden' : 'step'} aria-hidden={Boolean(scanned)}>
+              <p className="step-label">Step 1 of 2 · Scan</p>
+              <div className="scanner">
                 <video ref={videoRef} playsInline muted />
-                <div className="camera-overlay">
-                  {isReading ? 'Reading pass...' : 'Align pass in this frame'}
+                <div className="scan-frame" aria-hidden="true" />
+                <div className="scan-hud">
+                  <p className="scan-hint">
+                    {isReading ? 'Reading pass...' : 'Hold your pass inside the frame'}
+                  </p>
+                  <p className={`scan-status ${statusKind}`}>{statusMessage}</p>
                 </div>
               </div>
-              <p className={statusKind}>{statusMessage}</p>
-              {!isOnline && <p className="warning">Offline mode: check-ins will queue and sync later.</p>}
-              {pendingQueueCount > 0 && <p className="warning">{pendingQueueCount} queued check-ins pending sync.</p>}
-            </article>
+              {!isOnline && <p className="warning">Offline: check-ins queue and sync later.</p>}
+              {pendingQueueCount > 0 && (
+                <p className="warning">{pendingQueueCount} queued check-ins pending sync.</p>
+              )}
+            </section>
 
             {scanned && (
-              <article className="card">
-                <h2>Confirm and Mark Present</h2>
-                <dl className="readout">
-                  <div>
-                    <dt>Programme</dt>
-                    <dd>
-                      {activeProgramme
-                        ? `${activeProgramme.title} · ${formatProgrammeWindow(activeProgramme)}`
-                        : 'No programme selected'}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Program ID</dt>
-                    <dd>{scanned.programId}</dd>
-                  </div>
-                  <div>
-                    <dt>Full Name</dt>
-                    <dd>{scanned.fullName}</dd>
-                  </div>
-                  <div>
-                    <dt>Country</dt>
-                    <dd>{scanned.country}</dd>
-                  </div>
-                </dl>
-                <p className="info">Your live device location is stored with this check-in when you mark present.</p>
-                <button
-                  type="button"
-                  onClick={() => void handleMarkPresent()}
-                  disabled={isSubmitting || !activeProgramme}
-                >
-                  {isSubmitting ? 'Submitting...' : 'Mark Present'}
-                </button>
-              </article>
+              <section className="step">
+                <p className="step-label">Step 2 of 2 · Confirm</p>
+                <article className="card confirm">
+                  <h2>Is this you?</h2>
+                  <dl className="readout">
+                    <div>
+                      <dt>Full Name</dt>
+                      <dd className="readout-lead">{scanned.fullName}</dd>
+                    </div>
+                    <div>
+                      <dt>Program ID</dt>
+                      <dd>{scanned.programId}</dd>
+                    </div>
+                    <div>
+                      <dt>Country</dt>
+                      <dd>{scanned.country}</dd>
+                    </div>
+                    <div>
+                      <dt>Programme</dt>
+                      <dd>
+                        {activeProgramme
+                          ? `${activeProgramme.title} · ${formatProgrammeWindow(activeProgramme)}`
+                          : 'No programme selected'}
+                      </dd>
+                    </div>
+                  </dl>
+                  <p className="muted">Your live device location is stored with this check-in.</p>
+                </article>
+                <div className="action-bar">
+                  <button
+                    type="button"
+                    className="primary-action"
+                    onClick={() => void handleMarkPresent()}
+                    disabled={isSubmitting || !activeProgramme}
+                  >
+                    {isSubmitting ? 'Submitting...' : 'Mark Present'}
+                  </button>
+                  <button
+                    type="button"
+                    className="subtle"
+                    onClick={rescan}
+                    disabled={isSubmitting}
+                  >
+                    Scan again
+                  </button>
+                </div>
+              </section>
             )}
           </>
         )}
