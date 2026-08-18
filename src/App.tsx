@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { StaffPanel } from './StaffPanel'
 import { config } from './config'
-import { unlockCheckIn } from './lib/checkinAccess'
+import { unlockCheckIn, warmCheckInAccess } from './lib/checkinAccess'
 import { getCheckInLocation } from './lib/geolocation'
 import { isValidProgramId, normalizeProgramId } from './lib/programId'
 import { readPassFromImage } from './lib/readPass'
@@ -15,6 +15,12 @@ type ScannedPass = {
   programId: string
   fullName: string
   country: string
+}
+
+type FlowOutcome = {
+  kind: 'success' | 'duplicate' | 'queued' | 'error'
+  title: string
+  detail: string
 }
 
 const QUEUE_KEY = 'kylp-offline-queue'
@@ -34,7 +40,35 @@ const saveQueuedItems = (items: QueueItem[]): void => {
   window.localStorage.setItem(QUEUE_KEY, JSON.stringify(items))
 }
 
+const CHECKED_IN_KEY = 'kylp-checked-in'
+
+// Passes already marked present, grouped by programme, so a pass that is still
+// in front of the camera cannot be submitted twice for the same session.
+const readCheckedIn = (): Record<string, string[]> => {
+  const raw = window.localStorage.getItem(CHECKED_IN_KEY)
+  if (!raw) return {}
+  try {
+    return JSON.parse(raw) as Record<string, string[]>
+  } catch {
+    return {}
+  }
+}
+
+const hasCheckedIn = (sessionCode: string, programId: string): boolean =>
+  (readCheckedIn()[sessionCode] ?? []).includes(programId)
+
+const rememberCheckedIn = (sessionCode: string, programId: string): void => {
+  const all = readCheckedIn()
+  const forSession = all[sessionCode] ?? []
+  if (forSession.includes(programId)) return
+  window.localStorage.setItem(
+    CHECKED_IN_KEY,
+    JSON.stringify({ ...all, [sessionCode]: [...forSession, programId] }),
+  )
+}
+
 const ADMIN_PATH = '/admin'
+const RETURN_HOME_MS = 3000
 
 const currentPath = (): string => {
   const path = window.location.pathname.replace(/\/+$/, '')
@@ -73,6 +107,7 @@ function App() {
   const [isReading, setIsReading] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [scanned, setScanned] = useState<ScannedPass | null>(null)
+  const [outcome, setOutcome] = useState<FlowOutcome | null>(null)
   const [pendingQueueCount, setPendingQueueCount] = useState(0)
 
   const [now, setNow] = useState(() => new Date())
@@ -92,6 +127,27 @@ function App() {
   )
   const nextProgramme = useMemo(() => getNextProgramme(now), [now])
   const checkInOpen = Boolean(activeProgramme)
+  const flowHalted = outcome !== null
+
+  const resetToHome = () => {
+    scannedRef.current = null
+    submittingRef.current = false
+    setScanned(null)
+    setOutcome(null)
+    setIsSubmitting(false)
+    setCheckInUnlocked(false)
+    setProgramPinInput('')
+    setStatusKind('info')
+    setStatusMessage('Hold your pass in the frame. Scanning starts automatically.')
+  }
+
+  // Every terminal state, good or bad, parks on a message and then hands the
+  // device back to the next attendee at the PIN screen.
+  const finishWith = (next: FlowOutcome) => {
+    scannedRef.current = null
+    setScanned(null)
+    setOutcome(next)
+  }
 
   useEffect(() => {
     scannedRef.current = scanned
@@ -117,6 +173,18 @@ function App() {
   useEffect(() => {
     setPendingQueueCount(listQueuedItems().length)
   }, [])
+
+  useEffect(() => {
+    if (!isAdminRoute && !checkInUnlocked) {
+      warmCheckInAccess()
+    }
+  }, [isAdminRoute, checkInUnlocked])
+
+  useEffect(() => {
+    if (!flowHalted) return
+    const timer = window.setTimeout(resetToHome, RETURN_HOME_MS)
+    return () => window.clearTimeout(timer)
+  }, [flowHalted])
 
   useEffect(() => {
     const onPopState = () => setPath(currentPath())
@@ -150,7 +218,7 @@ function App() {
   }, [isOnline])
 
   useEffect(() => {
-    if (isAdminRoute || !checkInUnlocked || !activeProgramme) {
+    if (isAdminRoute || !checkInUnlocked || !activeProgramme || flowHalted) {
       streamRef.current?.getTracks().forEach((track) => track.stop())
       streamRef.current = null
       if (videoRef.current) videoRef.current.srcObject = null
@@ -210,6 +278,14 @@ function App() {
             fullName: result.pass.fullName,
             country: result.pass.country,
           }
+          if (hasCheckedIn(activeProgramme.code, pass.programId)) {
+            finishWith({
+              kind: 'duplicate',
+              title: 'Already checked in',
+              detail: `${pass.fullName} (${pass.programId}) is already marked present for ${activeProgramme.title}.`,
+            })
+            return
+          }
           scannedRef.current = pass
           setScanned(pass)
           setStatusKind('success')
@@ -238,8 +314,11 @@ function App() {
       .then(() => loop())
       .catch((error) => {
         if (cancelled) return
-        setStatusKind('error')
-        setStatusMessage(error instanceof Error ? error.message : 'Could not start the camera.')
+        finishWith({
+          kind: 'error',
+          title: 'Camera unavailable',
+          detail: error instanceof Error ? error.message : 'Could not start the camera.',
+        })
       })
 
     return () => {
@@ -249,7 +328,7 @@ function App() {
       streamRef.current = null
       if (videoRef.current) videoRef.current.srcObject = null
     }
-  }, [isAdminRoute, checkInUnlocked, activeProgramme?.code])
+  }, [isAdminRoute, checkInUnlocked, activeProgramme?.code, flowHalted])
 
   const queueCheckIn = (payload: OfflineCheckIn) => {
     const queued = listQueuedItems()
@@ -257,16 +336,23 @@ function App() {
       (item) => item.programId === payload.programId && item.sessionCode === payload.sessionCode,
     )
     if (duplicateQueued) {
-      setStatusKind('info')
-      setStatusMessage(`${payload.programId} is already queued for this programme.`)
+      finishWith({
+        kind: 'duplicate',
+        title: 'Already checked in',
+        detail: `${payload.fullName} (${payload.programId}) is already queued for ${payload.sessionLabel}.`,
+      })
       return
     }
     const next: QueueItem = { ...payload, id: Date.now() }
     const updated = [...queued, next]
     saveQueuedItems(updated)
     setPendingQueueCount(updated.length)
-    setStatusKind('info')
-    setStatusMessage('Network unavailable. Check-in queued and will sync automatically.')
+    rememberCheckedIn(payload.sessionCode, payload.programId)
+    finishWith({
+      kind: 'queued',
+      title: 'Check-in saved offline',
+      detail: `${payload.fullName} (${payload.programId}) is saved for ${payload.sessionLabel} and will sync automatically.`,
+    })
   }
 
   const handleUnlock = async () => {
@@ -287,16 +373,31 @@ function App() {
   const handleMarkPresent = async () => {
     if (!scanned) return
     if (!activeProgramme) {
-      setStatusKind('error')
-      setStatusMessage('Check-in is closed. There is no live programme right now.')
+      finishWith({
+        kind: 'error',
+        title: 'Check-in closed',
+        detail: 'There is no live programme right now, so this check-in was not recorded.',
+      })
       return
     }
     const normalizedId = normalizeProgramId(scanned.programId)
     const fullName = scanned.fullName.trim()
     const country = scanned.country.trim()
     if (!isValidProgramId(normalizedId) || !fullName || !country) {
-      setStatusKind('error')
-      setStatusMessage('Scan did not return a complete pass. Hold the pass in the frame again.')
+      finishWith({
+        kind: 'error',
+        title: 'Pass could not be read',
+        detail: 'The scan did not return a complete pass. Please start again and hold the pass steady.',
+      })
+      return
+    }
+
+    if (hasCheckedIn(activeProgramme.code, normalizedId)) {
+      finishWith({
+        kind: 'duplicate',
+        title: 'Already checked in',
+        detail: `${fullName} (${normalizedId}) is already marked present for ${activeProgramme.title}.`,
+      })
       return
     }
 
@@ -306,8 +407,11 @@ function App() {
     const location = await getCheckInLocation()
     if (location.locationStatus !== 'ok') {
       setIsSubmitting(false)
-      setStatusKind('error')
-      setStatusMessage('Turn on location and try Mark Present again. Check-in needs the live device location.')
+      finishWith({
+        kind: 'error',
+        title: 'Location required',
+        detail: 'Turn on location for this site, then start again. Check-in needs the live device location.',
+      })
       return
     }
 
@@ -326,27 +430,28 @@ function App() {
 
     if (!isOnline) {
       queueCheckIn(payload)
-      scannedRef.current = null
-      setScanned(null)
       setIsSubmitting(false)
       return
     }
 
     try {
       const result = await submitToGoogleSheet(payload)
+      rememberCheckedIn(activeProgramme.code, normalizedId)
       if (result.duplicate) {
-        setStatusKind('info')
-        setStatusMessage(`${normalizedId} is already marked present for ${activeProgramme.title}.`)
+        finishWith({
+          kind: 'duplicate',
+          title: 'Already checked in',
+          detail: `${fullName} (${normalizedId}) was already marked present for ${activeProgramme.title}.`,
+        })
       } else {
-        setStatusKind('success')
-        setStatusMessage(`Marked Present: ${fullName} (${normalizedId}) for ${activeProgramme.title}.`)
+        finishWith({
+          kind: 'success',
+          title: 'Attendance recorded',
+          detail: `${fullName} (${normalizedId}) is marked present for ${activeProgramme.title}.`,
+        })
       }
-      scannedRef.current = null
-      setScanned(null)
     } catch {
       queueCheckIn(payload)
-      scannedRef.current = null
-      setScanned(null)
     } finally {
       setIsSubmitting(false)
     }
@@ -412,6 +517,15 @@ function App() {
           <StaffPanel liveProgramme={activeProgramme} onClose={goHome} />
         ) : !checkInUnlocked ? (
           checkInGate
+        ) : outcome ? (
+          <article className={`card outcome outcome-${outcome.kind}`}>
+            <h2>{outcome.title}</h2>
+            <p>{outcome.detail}</p>
+            <p className="muted">Returning to the start for the next person...</p>
+            <button type="button" onClick={resetToHome}>
+              Done
+            </button>
+          </article>
         ) : !checkInOpen ? (
           <article className="card">
             <h2>Check-in closed</h2>

@@ -181,6 +181,40 @@ select {
   color: #9a3412;
 }
 
+.muted {
+  color: #6b7280;
+  font-size: 0.9rem;
+}
+
+.outcome {
+  border-left-width: 6px;
+  text-align: center;
+}
+
+.outcome h2 {
+  font-size: 1.35rem;
+}
+
+.outcome-success {
+  border-left-color: #047857;
+  background: #f0fdf4;
+}
+
+.outcome-duplicate {
+  border-left-color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.outcome-queued {
+  border-left-color: #9a3412;
+  background: #fff7ed;
+}
+
+.outcome-error {
+  border-left-color: #b91c1c;
+  background: #fef2f2;
+}
+
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
