@@ -11,6 +11,65 @@ const scriptSupportsPins = (error?: string): boolean => {
   return !error.startsWith('missing_') && error !== 'unauthorized'
 }
 
+// Apps Script costs 2-13s per call, so remember what the deployment can do and
+// what it already told us instead of paying that round trip on every unlock.
+const CAPABILITY_TTL_MS = 10 * 60 * 1000
+const VERIFY_TTL_MS = 60 * 1000
+
+let pinSupport: { supported: boolean; checkedAt: number } | null = null
+const verifyCache = new Map<string, { granted: boolean; expiresAt: number }>()
+
+const capabilityIsFresh = (): boolean =>
+  pinSupport !== null && Date.now() - pinSupport.checkedAt < CAPABILITY_TTL_MS
+
+const rememberCapability = (error?: string): void => {
+  pinSupport = { supported: scriptSupportsPins(error), checkedAt: Date.now() }
+}
+
+const resetAccessCache = (): void => {
+  verifyCache.clear()
+  pinSupport = { supported: true, checkedAt: Date.now() }
+}
+
+const probeAppsScript = async (): Promise<void> => {
+  // An empty PIN can never match a stored or default PIN, so this only
+  // reveals whether the deployment understands verifyPin at all.
+  const result = await callAppsScript({
+    action: 'verifyPin',
+    pin: '',
+    sessionCode: '',
+    defaultPin: defaultProgramPin(),
+  })
+  rememberCapability(result.error)
+}
+
+const resolveUnlock = async (pin: string, sessionCode: string): Promise<boolean> => {
+  // A deployment without verifyPin can only ever be judged against the default
+  // PIN locally, so skip the round trip whose answer we would discard anyway.
+  if (capabilityIsFresh() && pinSupport?.supported === false) {
+    return pin === defaultProgramPin()
+  }
+
+  const cacheKey = `${sessionCode}|${pin}`
+  const cached = verifyCache.get(cacheKey)
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.granted
+  }
+
+  const result = await callAppsScript({
+    action: 'verifyPin',
+    pin,
+    sessionCode,
+    defaultPin: defaultProgramPin(),
+  })
+  rememberCapability(result.error)
+
+  const granted =
+    result.ok === true || (!scriptSupportsPins(result.error) && pin === defaultProgramPin())
+  verifyCache.set(cacheKey, { granted, expiresAt: Date.now() + VERIFY_TTL_MS })
+  return granted
+}
+
 async function handler(request: Request): Promise<Response> {
   if (request.method !== 'POST') {
     return jsonResponse({ error: 'Method not allowed' }, 405)
@@ -29,6 +88,13 @@ async function handler(request: Request): Promise<Response> {
   }
 
   try {
+    if (body.action === 'warm') {
+      if (!capabilityIsFresh()) {
+        await probeAppsScript()
+      }
+      return jsonResponse({ ok: true })
+    }
+
     if (body.action === 'unlock') {
       const live = getActiveProgramme()
       if (enforceProgrammeWindow() && !live) {
@@ -40,16 +106,8 @@ async function handler(request: Request): Promise<Response> {
         return jsonResponse({ error: 'PIN is required' }, 400)
       }
 
-      const result = await callAppsScript({
-        action: 'verifyPin',
-        pin,
-        sessionCode,
-        defaultPin: defaultProgramPin(),
-      })
-      if (result.ok) {
-        return jsonResponse({ ok: true, sessionCode, sessionLabel: live?.title ?? '' })
-      }
-      if (!scriptSupportsPins(result.error) && pin === defaultProgramPin()) {
+      const granted = await resolveUnlock(pin, sessionCode)
+      if (granted) {
         return jsonResponse({ ok: true, sessionCode, sessionLabel: live?.title ?? '' })
       }
       return jsonResponse({ error: 'Incorrect program PIN.' }, 401)
@@ -89,6 +147,7 @@ async function handler(request: Request): Promise<Response> {
         title: body.title ?? '',
       })
       if (result.ok) {
+        resetAccessCache()
         return jsonResponse({ ok: true, pins: result.pins ?? [] })
       }
       if (!scriptSupportsPins(result.error)) {

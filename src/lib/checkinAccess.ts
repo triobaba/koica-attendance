@@ -18,6 +18,12 @@ const readError = async (response: Response): Promise<string> => {
   return body?.error ?? `Request failed (${response.status})`
 }
 
+// Apps Script is slowest on its first hit, so pay that cost in the background
+// while the attendee is still reading the screen.
+export const warmCheckInAccess = (): void => {
+  void postAccess({ action: 'warm' }).catch(() => {})
+}
+
 export const unlockCheckIn = async (pin: string): Promise<void> => {
   const response = await postAccess({ action: 'unlock', pin })
   if (!response.ok) {
