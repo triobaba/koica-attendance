@@ -19,5 +19,12 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["vite.config.ts", "vite.local-api.ts", "api/**/*.ts", "src/schedule.ts", "src/types.ts"]
+  "include": [
+    "vite.config.ts",
+    "vite.local-api.ts",
+    "api/**/*.ts",
+    "lib/**/*.ts",
+    "src/schedule.ts",
+    "src/types.ts"
+  ]
 }

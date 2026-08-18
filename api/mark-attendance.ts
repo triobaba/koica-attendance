@@ -1,6 +1,6 @@
 import { getActiveProgramme } from '../src/schedule.ts'
-import { callAppsScript, jsonResponse } from './apps-script.ts'
-import { serverEnv } from './env.ts'
+import { callAppsScript, jsonResponse } from '../lib/apps-script.ts'
+import { serverEnv } from '../lib/env.ts'
 
 type MarkAttendancePayload = {
   programId: string

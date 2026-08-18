@@ -1,6 +1,6 @@
 import { getActiveProgramme } from '../src/schedule.ts'
-import { callAppsScript, jsonResponse } from './apps-script.ts'
-import { serverEnv } from './env.ts'
+import { callAppsScript, jsonResponse } from '../lib/apps-script.ts'
+import { serverEnv } from '../lib/env.ts'
 
 const defaultProgramPin = () => serverEnv('VITE_PROGRAM_PIN', '1234')
 const staffPin = () => serverEnv('STAFF_PIN', serverEnv('VITE_STAFF_PIN', '5678'))

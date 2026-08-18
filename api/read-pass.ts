@@ -1,4 +1,4 @@
-import { serverEnv } from './env.ts'
+import { serverEnv } from '../lib/env.ts'
 
 type ParsedPass = {
   programId: string
