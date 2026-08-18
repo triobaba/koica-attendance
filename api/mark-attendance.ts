@@ -21,7 +21,7 @@ type MarkAttendancePayload = {
 
 const enforceProgrammeWindow = () => serverEnv('VITE_ENFORCE_PROGRAMME_WINDOW', 'true') === 'true'
 
-export default async function handler(request: Request): Promise<Response> {
+async function handler(request: Request): Promise<Response> {
   if (request.method !== 'POST') {
     return jsonResponse({ error: 'Method not allowed' }, 405)
   }
@@ -56,3 +56,5 @@ export default async function handler(request: Request): Promise<Response> {
     )
   }
 }
+
+export default { fetch: handler }

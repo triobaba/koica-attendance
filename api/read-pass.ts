@@ -121,7 +121,7 @@ const jsonError = (error: string, details?: string, status = 502): Response =>
     headers: { 'Content-Type': 'application/json' },
   })
 
-export default async function handler(request: Request): Promise<Response> {
+async function handler(request: Request): Promise<Response> {
   if (request.method !== 'POST') {
     return jsonError('Method not allowed', undefined, 405)
   }
@@ -215,3 +215,5 @@ export default async function handler(request: Request): Promise<Response> {
     headers: { 'Content-Type': 'application/json' },
   })
 }
+
+export default { fetch: handler }

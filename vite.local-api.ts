@@ -5,9 +5,9 @@ import markAttendance from './api/mark-attendance.ts'
 import readPass from './api/read-pass.ts'
 
 const handlers: Record<string, (request: Request) => Promise<Response>> = {
-  '/api/read-pass': readPass,
-  '/api/mark-attendance': markAttendance,
-  '/api/checkin-access': checkinAccess,
+  '/api/read-pass': readPass.fetch,
+  '/api/mark-attendance': markAttendance.fetch,
+  '/api/checkin-access': checkinAccess.fetch,
 }
 
 const readBody = async (req: IncomingMessage): Promise<string> => {

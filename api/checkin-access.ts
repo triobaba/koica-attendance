@@ -15,7 +15,10 @@ const scriptSupportsPins = (error?: string): boolean => {
   return !error.startsWith('missing_') && error !== 'unauthorized'
 }
 
-export default async function handler(request: Request): Promise<Response> {
+async function handler(request: Request): Promise<Response> {
+  // #region agent log
+  fetch('http://127.0.0.1:7340/ingest/5d4c122e-e010-454f-b4af-74372fe873f8',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'e1c2be'},body:JSON.stringify({sessionId:'e1c2be',runId:'post-fix-h3',hypothesisId:'H3',location:'api/checkin-access.ts:handler',message:'handler invoked, checking request shape',data:{method:(request as {method?:string}).method??null,jsonType:typeof (request as {json?:unknown}).json,isWebRequest:typeof Request!=='undefined'&&request instanceof Request},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
   if (request.method !== 'POST') {
     return jsonResponse({ error: 'Method not allowed' }, 405)
   }
@@ -114,3 +117,5 @@ export default async function handler(request: Request): Promise<Response> {
     )
   }
 }
+
+export default { fetch: handler }
