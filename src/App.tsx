@@ -1,0 +1,489 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { StaffPanel } from './StaffPanel'
+import { config } from './config'
+import { unlockCheckIn } from './lib/checkinAccess'
+import { getCheckInLocation } from './lib/geolocation'
+import { isValidProgramId, normalizeProgramId } from './lib/programId'
+import { readPassFromImage } from './lib/readPass'
+import { submitToGoogleSheet } from './lib/sheetAttendance'
+import { formatProgrammeWindow, getCheckInProgramme, getNextProgramme } from './schedule'
+import type { OfflineCheckIn } from './types'
+
+type QueueItem = OfflineCheckIn & { id: number }
+
+type ScannedPass = {
+  programId: string
+  fullName: string
+  country: string
+}
+
+const QUEUE_KEY = 'kylp-offline-queue'
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const listQueuedItems = (): QueueItem[] => {
+  const raw = window.localStorage.getItem(QUEUE_KEY)
+  if (!raw) return []
+  try {
+    return JSON.parse(raw) as QueueItem[]
+  } catch {
+    return []
+  }
+}
+
+const saveQueuedItems = (items: QueueItem[]): void => {
+  window.localStorage.setItem(QUEUE_KEY, JSON.stringify(items))
+}
+
+const ADMIN_PATH = '/admin'
+
+const currentPath = (): string => {
+  const path = window.location.pathname.replace(/\/+$/, '')
+  return path === '' ? '/' : path
+}
+
+const captureJpegBase64 = (video: HTMLVideoElement): string => {
+  const naturalWidth = video.videoWidth
+  const naturalHeight = video.videoHeight
+  if (naturalWidth < 16 || naturalHeight < 16) {
+    throw new Error('Camera is not ready yet')
+  }
+
+  const outputWidth = Math.min(640, naturalWidth)
+  const outputHeight = Math.floor((outputWidth / naturalWidth) * naturalHeight)
+  const canvas = document.createElement('canvas')
+  canvas.width = outputWidth
+  canvas.height = outputHeight
+  const context = canvas.getContext('2d')
+  if (!context) {
+    throw new Error('Could not read camera frame')
+  }
+  context.drawImage(video, 0, 0, outputWidth, outputHeight)
+  return canvas.toDataURL('image/jpeg', 0.55).split(',')[1] ?? ''
+}
+
+function App() {
+  const [programPinInput, setProgramPinInput] = useState('')
+  const [checkInUnlocked, setCheckInUnlocked] = useState(false)
+  const [path, setPath] = useState(currentPath)
+  const [isUnlocking, setIsUnlocking] = useState(false)
+  const isAdminRoute = path === ADMIN_PATH
+
+  const [statusMessage, setStatusMessage] = useState('Hold your pass in the frame. Scanning starts automatically.')
+  const [statusKind, setStatusKind] = useState<'info' | 'error' | 'success'>('info')
+  const [isReading, setIsReading] = useState(false)
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [scanned, setScanned] = useState<ScannedPass | null>(null)
+  const [pendingQueueCount, setPendingQueueCount] = useState(0)
+
+  const [now, setNow] = useState(() => new Date())
+  const [isOnline, setIsOnline] = useState(navigator.onLine)
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const scannedRef = useRef<ScannedPass | null>(null)
+  const submittingRef = useRef(false)
+  const readingRef = useRef(false)
+  const activeProgramme = useMemo(
+    () =>
+      getCheckInProgramme(now, {
+        enforceWindow: config.enforceProgrammeWindow,
+        overrideCode: config.programmeCodeOverride,
+      }),
+    [now],
+  )
+  const nextProgramme = useMemo(() => getNextProgramme(now), [now])
+  const checkInOpen = Boolean(activeProgramme)
+
+  useEffect(() => {
+    scannedRef.current = scanned
+  }, [scanned])
+
+  useEffect(() => {
+    submittingRef.current = isSubmitting
+  }, [isSubmitting])
+
+  useEffect(() => {
+    const onOnline = () => setIsOnline(true)
+    const onOffline = () => setIsOnline(false)
+    window.addEventListener('online', onOnline)
+    window.addEventListener('offline', onOffline)
+    const tick = window.setInterval(() => setNow(new Date()), 15_000)
+    return () => {
+      window.removeEventListener('online', onOnline)
+      window.removeEventListener('offline', onOffline)
+      window.clearInterval(tick)
+    }
+  }, [])
+
+  useEffect(() => {
+    setPendingQueueCount(listQueuedItems().length)
+  }, [])
+
+  useEffect(() => {
+    const onPopState = () => setPath(currentPath())
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      streamRef.current?.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    const flushQueue = async (): Promise<void> => {
+      if (!isOnline) return
+      const queued = listQueuedItems()
+      const remaining: QueueItem[] = []
+      for (const item of queued) {
+        try {
+          await submitToGoogleSheet(item)
+        } catch {
+          remaining.push(item)
+        }
+      }
+      saveQueuedItems(remaining)
+      setPendingQueueCount(remaining.length)
+    }
+    void flushQueue()
+  }, [isOnline])
+
+  useEffect(() => {
+    if (isAdminRoute || !checkInUnlocked || !activeProgramme) {
+      streamRef.current?.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+      if (videoRef.current) videoRef.current.srcObject = null
+      return
+    }
+
+    let cancelled = false
+    const abortReads = new AbortController()
+
+    const startCamera = async () => {
+      if (streamRef.current) return
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+        audio: false,
+      })
+      streamRef.current = stream
+      const video = videoRef.current
+      if (video) {
+        video.srcObject = stream
+        await video.play()
+        if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+          await new Promise<void>((resolve) => {
+            video.addEventListener('loadeddata', () => resolve(), { once: true })
+          })
+        }
+      }
+    }
+
+    const loop = async () => {
+      setStatusKind('info')
+      setStatusMessage('Hold your pass in the frame. Scanning starts automatically.')
+      while (!cancelled) {
+        if (scannedRef.current || submittingRef.current || readingRef.current) {
+          await sleep(250)
+          continue
+        }
+
+        const video = videoRef.current
+        if (!video || video.videoWidth < 16) {
+          await sleep(200)
+          continue
+        }
+
+        readingRef.current = true
+        setIsReading(true)
+        setStatusKind('info')
+        setStatusMessage('Reading pass...')
+        try {
+          const imageBase64 = captureJpegBase64(video)
+          const result = await readPassFromImage(imageBase64, {
+            timeoutMs: 5000,
+            signal: abortReads.signal,
+          })
+          if (cancelled) return
+          const pass = {
+            programId: normalizeProgramId(result.pass.programId),
+            fullName: result.pass.fullName,
+            country: result.pass.country,
+          }
+          scannedRef.current = pass
+          setScanned(pass)
+          setStatusKind('success')
+          setStatusMessage('Pass read. Confirm below.')
+        } catch (error) {
+          if (cancelled) return
+          const message = error instanceof Error ? error.message : 'Scan failed'
+          if (message === 'NO_ID') {
+            setStatusKind('info')
+            setStatusMessage('Hold your pass steady in the frame.')
+            await sleep(450)
+          } else {
+            setStatusKind('error')
+            setStatusMessage(message)
+            await sleep(1200)
+          }
+        } finally {
+          readingRef.current = false
+          setIsReading(false)
+        }
+      }
+    }
+
+    void startCamera()
+      .then(() => sleep(150))
+      .then(() => loop())
+      .catch((error) => {
+        if (cancelled) return
+        setStatusKind('error')
+        setStatusMessage(error instanceof Error ? error.message : 'Could not start the camera.')
+      })
+
+    return () => {
+      cancelled = true
+      abortReads.abort()
+      streamRef.current?.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+      if (videoRef.current) videoRef.current.srcObject = null
+    }
+  }, [isAdminRoute, checkInUnlocked, activeProgramme?.code])
+
+  const queueCheckIn = (payload: OfflineCheckIn) => {
+    const queued = listQueuedItems()
+    const duplicateQueued = queued.some(
+      (item) => item.programId === payload.programId && item.sessionCode === payload.sessionCode,
+    )
+    if (duplicateQueued) {
+      setStatusKind('info')
+      setStatusMessage(`${payload.programId} is already queued for this programme.`)
+      return
+    }
+    const next: QueueItem = { ...payload, id: Date.now() }
+    const updated = [...queued, next]
+    saveQueuedItems(updated)
+    setPendingQueueCount(updated.length)
+    setStatusKind('info')
+    setStatusMessage('Network unavailable. Check-in queued and will sync automatically.')
+  }
+
+  const handleUnlock = async () => {
+    setIsUnlocking(true)
+    try {
+      await unlockCheckIn(programPinInput)
+      setCheckInUnlocked(true)
+      setStatusKind('info')
+      setStatusMessage('Hold your pass in the frame. Scanning starts automatically.')
+    } catch (error) {
+      setStatusKind('error')
+      setStatusMessage(error instanceof Error ? error.message : 'Incorrect program PIN.')
+    } finally {
+      setIsUnlocking(false)
+    }
+  }
+
+  const handleMarkPresent = async () => {
+    if (!scanned) return
+    if (!activeProgramme) {
+      setStatusKind('error')
+      setStatusMessage('Check-in is closed. There is no live programme right now.')
+      return
+    }
+    const normalizedId = normalizeProgramId(scanned.programId)
+    const fullName = scanned.fullName.trim()
+    const country = scanned.country.trim()
+    if (!isValidProgramId(normalizedId) || !fullName || !country) {
+      setStatusKind('error')
+      setStatusMessage('Scan did not return a complete pass. Hold the pass in the frame again.')
+      return
+    }
+
+    setIsSubmitting(true)
+    setStatusKind('info')
+    setStatusMessage('Capturing check-in location...')
+    const location = await getCheckInLocation()
+    if (location.locationStatus !== 'ok') {
+      setIsSubmitting(false)
+      setStatusKind('error')
+      setStatusMessage('Turn on location and try Mark Present again. Check-in needs the live device location.')
+      return
+    }
+
+    const payload: OfflineCheckIn = {
+      programId: normalizedId,
+      fullName,
+      country,
+      attendanceDate: activeProgramme.date,
+      sessionCode: activeProgramme.code,
+      sessionLabel: activeProgramme.title,
+      programmeWindow: formatProgrammeWindow(activeProgramme),
+      source: 'vision',
+      editedBeforeConfirm: false,
+      ...location,
+    }
+
+    if (!isOnline) {
+      queueCheckIn(payload)
+      scannedRef.current = null
+      setScanned(null)
+      setIsSubmitting(false)
+      return
+    }
+
+    try {
+      const result = await submitToGoogleSheet(payload)
+      if (result.duplicate) {
+        setStatusKind('info')
+        setStatusMessage(`${normalizedId} is already marked present for ${activeProgramme.title}.`)
+      } else {
+        setStatusKind('success')
+        setStatusMessage(`Marked Present: ${fullName} (${normalizedId}) for ${activeProgramme.title}.`)
+      }
+      scannedRef.current = null
+      setScanned(null)
+    } catch {
+      queueCheckIn(payload)
+      scannedRef.current = null
+      setScanned(null)
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  const checkInGate = (
+    <form
+      className="card"
+      onSubmit={(event) => {
+        event.preventDefault()
+        void handleUnlock()
+      }}
+    >
+      <h2>Program Check-in PIN</h2>
+      {checkInOpen && activeProgramme ? (
+        <p>
+          Enter the PIN for {activeProgramme.title} ({formatProgrammeWindow(activeProgramme)}) to begin self check-in.
+        </p>
+      ) : (
+        <p>
+          Check-in is closed until a programme is live
+          {nextProgramme
+            ? ` (next: ${nextProgramme.title} at ${formatProgrammeWindow(nextProgramme)}).`
+            : '.'}
+        </p>
+      )}
+      <input
+        type="password"
+        value={programPinInput}
+        onChange={(event) => setProgramPinInput(event.target.value)}
+        placeholder="Program PIN"
+        autoComplete="current-password"
+        disabled={!checkInOpen}
+      />
+      <button type="submit" disabled={!checkInOpen || isUnlocking || programPinInput.length < 4}>
+        {isUnlocking ? 'Checking...' : 'Unlock check-in'}
+      </button>
+      {statusKind === 'error' && <p className="error">{statusMessage}</p>}
+    </form>
+  )
+
+  const goHome = () => {
+    window.history.pushState({}, '', '/')
+    setPath('/')
+  }
+
+  return (
+    <main className="page">
+      <header className="topbar">
+        <h1>KOICA Youth Leaders Attendance</h1>
+        <span>
+          {isAdminRoute
+            ? 'Staff admin'
+            : activeProgramme
+              ? `${activeProgramme.title} · ${formatProgrammeWindow(activeProgramme)}`
+              : nextProgramme
+                ? `Closed · next ${nextProgramme.title} ${formatProgrammeWindow(nextProgramme)}`
+                : 'Check-in closed'}
+        </span>
+      </header>
+      <section className="card-stack">
+        {isAdminRoute ? (
+          <StaffPanel liveProgramme={activeProgramme} onClose={goHome} />
+        ) : !checkInUnlocked ? (
+          checkInGate
+        ) : !checkInOpen ? (
+          <article className="card">
+            <h2>Check-in closed</h2>
+            <p>
+              {nextProgramme
+                ? `The live window has ended. Next programme: ${nextProgramme.title} (${formatProgrammeWindow(nextProgramme)}).`
+                : 'There is no live programme right now.'}
+            </p>
+            <button type="button" className="subtle" onClick={() => setCheckInUnlocked(false)}>
+              Enter a new PIN
+            </button>
+          </article>
+        ) : (
+          <>
+            <article className="card">
+              <h2>Self Check-in</h2>
+              <p>
+                {activeProgramme
+                  ? `Hold the pass in the frame. Checking in for ${activeProgramme.title} (${formatProgrammeWindow(activeProgramme)}).`
+                  : 'Hold the pass in the frame.'}
+              </p>
+              <div className="camera-wrap">
+                <video ref={videoRef} playsInline muted />
+                <div className="camera-overlay">
+                  {isReading ? 'Reading pass...' : 'Align pass in this frame'}
+                </div>
+              </div>
+              <p className={statusKind}>{statusMessage}</p>
+              {!isOnline && <p className="warning">Offline mode: check-ins will queue and sync later.</p>}
+              {pendingQueueCount > 0 && <p className="warning">{pendingQueueCount} queued check-ins pending sync.</p>}
+            </article>
+
+            {scanned && (
+              <article className="card">
+                <h2>Confirm and Mark Present</h2>
+                <dl className="readout">
+                  <div>
+                    <dt>Programme</dt>
+                    <dd>
+                      {activeProgramme
+                        ? `${activeProgramme.title} · ${formatProgrammeWindow(activeProgramme)}`
+                        : 'No programme selected'}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Program ID</dt>
+                    <dd>{scanned.programId}</dd>
+                  </div>
+                  <div>
+                    <dt>Full Name</dt>
+                    <dd>{scanned.fullName}</dd>
+                  </div>
+                  <div>
+                    <dt>Country</dt>
+                    <dd>{scanned.country}</dd>
+                  </div>
+                </dl>
+                <p className="info">Your live device location is stored with this check-in when you mark present.</p>
+                <button
+                  type="button"
+                  onClick={() => void handleMarkPresent()}
+                  disabled={isSubmitting || !activeProgramme}
+                >
+                  {isSubmitting ? 'Submitting...' : 'Mark Present'}
+                </button>
+              </article>
+            )}
+          </>
+        )}
+      </section>
+    </main>
+  )
+}
+
+export default App
