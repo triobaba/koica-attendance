@@ -6,6 +6,7 @@ const HEADER_ROWS = 3
 const FIXED_COLS = 3
 const LOG_HEADERS = ['Checked in at', 'Date', 'Day', 'Programme', 'Time', 'Program ID', 'Full Name', 'Country', 'Latitude', 'Longitude', 'Accuracy m', 'Maps', 'Location status']
 const PIN_HEADERS = ['Programme code', 'Programme', 'PIN', 'Updated at']
+const COUNTRY_SHEETS = ['Ghana', 'Cameroon', 'Côte d’Ivoire', 'Nigeria', 'Senegal']
 
 const PROGRAMMES = [
   { code: "koica-2026-001", date: "2026-08-17", dayLabel: "Mon 17 Aug", time: "09:00\u201310:30", title: "Orientation, program briefing & team formation" },
@@ -78,6 +79,7 @@ function handleAttendance(body) {
       return jsonResponse({ ok: false, error: 'missing_' + required[i] })
     }
   }
+  body.country = canonicalCountry(body.country)
 
   const lock = LockService.getScriptLock()
   if (!lock.tryLock(15000)) {
@@ -125,8 +127,42 @@ function getOrCreateSheet(name) {
   return ss.getSheetByName(name) || ss.insertSheet(name)
 }
 
+function canonicalCountry(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+
+  const withoutAccents = raw.normalize
+    ? raw.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    : raw
+  const key = withoutAccents.toLowerCase().replace(/[’']/g, '').replace(/[^a-z]/g, '')
+
+  if (key === 'ghana' || key === 'ghanaian') return 'Ghana'
+  if (key === 'cameroon' || key === 'cameroonian') return 'Cameroon'
+  if (
+    key === 'cotedivoire' ||
+    key === 'cotedivoir' ||
+    key === 'ivorycoast' ||
+    key === 'ivorian'
+  ) {
+    return 'Côte d’Ivoire'
+  }
+  if (key === 'nigeria' || key === 'nigerian') return 'Nigeria'
+  if (key === 'senegal' || key === 'senegalese') return 'Senegal'
+  return raw
+}
+
+function ensureSheetSize(sheet, rows, columns) {
+  if (sheet.getMaxRows() < rows) {
+    sheet.insertRowsAfter(sheet.getMaxRows(), rows - sheet.getMaxRows())
+  }
+  if (sheet.getMaxColumns() < columns) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), columns - sheet.getMaxColumns())
+  }
+}
+
 function ensureGridHeaders(sheet) {
   const lastCol = FIXED_COLS + PROGRAMMES.length
+  ensureSheetSize(sheet, HEADER_ROWS + 1, lastCol)
   const existing = sheet.getRange(3, FIXED_COLS + 1, 1, PROGRAMMES.length).getValues()[0]
   const expected = PROGRAMMES.map(function (item) { return item.code })
   if (existing.join('|') === expected.join('|') && sheet.getRange(1, 1).getValue() === '') {
@@ -177,6 +213,95 @@ function ensureGridHeaders(sheet) {
   for (var col = FIXED_COLS + 1; col <= lastCol; col++) {
     sheet.setColumnWidth(col, 140)
   }
+}
+
+function columnLetter(column) {
+  var result = ''
+  var current = column
+  while (current > 0) {
+    const remainder = (current - 1) % 26
+    result = String.fromCharCode(65 + remainder) + result
+    current = Math.floor((current - 1) / 26)
+  }
+  return result
+}
+
+function normalizeExistingCountries(sheet) {
+  const lastRow = sheet.getLastRow()
+  if (lastRow <= HEADER_ROWS) return
+
+  const range = sheet.getRange(HEADER_ROWS + 1, 3, lastRow - HEADER_ROWS, 1)
+  const values = range.getValues()
+  var changed = false
+  for (var i = 0; i < values.length; i++) {
+    const canonical = canonicalCountry(values[i][0])
+    if (canonical !== values[i][0]) {
+      values[i][0] = canonical
+      changed = true
+    }
+  }
+  if (changed) range.setValues(values)
+}
+
+function countryFilterFormula(country, lastCol, lastMasterRow) {
+  const masterName = GRID_SHEET.replace(/'/g, "''")
+  const escapedCountry = country.replace(/"/g, '""')
+  const lastColumn = columnLetter(lastCol)
+  return (
+    "=IFERROR(FILTER('" +
+    masterName +
+    "'!A4:" +
+    lastColumn +
+    lastMasterRow +
+    ",'" +
+    masterName +
+    "'!C4:C" +
+    lastMasterRow +
+    '="' +
+    escapedCountry +
+    '"),"")'
+  )
+}
+
+function configureCountrySheet(sheet, master, country) {
+  const lastCol = FIXED_COLS + PROGRAMMES.length
+  const lastMasterRow = Math.max(master.getMaxRows(), HEADER_ROWS + 1)
+  ensureSheetSize(sheet, lastMasterRow, lastCol)
+  ensureGridHeaders(sheet)
+
+  const dataRows = sheet.getMaxRows() - HEADER_ROWS
+  sheet.getRange(HEADER_ROWS + 1, 1, dataRows, sheet.getMaxColumns()).clearContent()
+
+  sheet
+    .getRange(HEADER_ROWS + 1, 1)
+    .setFormula(countryFilterFormula(country, lastCol, lastMasterRow))
+
+  const presentRange = sheet.getRange(
+    HEADER_ROWS + 1,
+    FIXED_COLS + 1,
+    dataRows,
+    lastCol - FIXED_COLS,
+  )
+  const presentRule = SpreadsheetApp.newConditionalFormatRule()
+    .whenTextEqualTo('Present')
+    .setBackground('#d1fae5')
+    .setRanges([presentRange])
+    .build()
+  sheet.setConditionalFormatRules([presentRule])
+}
+
+// Run this once after deploying the script. The five tabs remain live views of
+// Attendance, so future check-ins appear automatically without extra writes.
+function setupCountrySheets() {
+  const master = getOrCreateSheet(GRID_SHEET)
+  ensureGridHeaders(master)
+  normalizeExistingCountries(master)
+
+  for (var i = 0; i < COUNTRY_SHEETS.length; i++) {
+    const country = COUNTRY_SHEETS[i]
+    configureCountrySheet(getOrCreateSheet(country), master, country)
+  }
+  SpreadsheetApp.flush()
 }
 
 function markGridPresent(body, programme) {

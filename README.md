@@ -87,6 +87,14 @@ https://script.google.com/macros/s/AKfycb.../exec
 
 If you change the script later: **Deploy → Manage deployments → Edit (pencil) → New version → Deploy**.
 
+### Country attendance tabs
+
+After deploying the latest script, select `setupCountrySheets` in the Apps Script
+function menu and click **Run** once. It creates live attendance views for Ghana,
+Cameroon, Côte d’Ivoire, Nigeria, and Senegal. Existing country spellings are
+normalized and future check-ins update the country tabs automatically from the
+master `Attendance` sheet.
+
 ### 4. What the spreadsheet looks like
 
 After you paste the updated `docs/apps-script-example.gs` and deploy a **new version**, the first check-in creates two tabs:
