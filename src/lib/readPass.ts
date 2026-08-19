@@ -6,6 +6,30 @@ type ReadPassResponse = {
   rawText: string
 }
 
+export class PassReadRateLimitError extends Error {
+  retryAfterMs: number
+
+  constructor(retryAfterMs: number) {
+    super('Vision service is busy. Retrying automatically.')
+    this.name = 'PassReadRateLimitError'
+    this.retryAfterMs = retryAfterMs
+  }
+}
+
+const retryAfterMs = (response: Response): number => {
+  const value = response.headers.get('retry-after')
+  if (!value) return 2_000
+
+  const seconds = Number(value)
+  if (Number.isFinite(seconds)) {
+    return Math.max(1_000, Math.min(seconds * 1_000, 30_000))
+  }
+
+  const dateMs = Date.parse(value)
+  if (Number.isNaN(dateMs)) return 2_000
+  return Math.max(1_000, Math.min(dateMs - Date.now(), 30_000))
+}
+
 export const readPassFromImage = async (
   imageBase64: string,
   options?: { timeoutMs?: number; signal?: AbortSignal },
@@ -24,11 +48,15 @@ export const readPassFromImage = async (
       signal: controller.signal,
     })
 
+    if (response.status === 429) {
+      throw new PassReadRateLimitError(retryAfterMs(response))
+    }
+
     if (!response.ok) {
       const body = (await response.json().catch(() => null)) as { error?: string; details?: string } | null
       const detail = typeof body?.details === 'string' ? body.details : ''
-      const geminiMessage = detail.match(/"message":\s*"([^"]+)"/)?.[1]
-      throw new Error(geminiMessage ?? body?.error ?? `Vision API failed with status ${response.status}`)
+      const modelMessage = detail.match(/"message":\s*"([^"]+)"/)?.[1]
+      throw new Error(modelMessage ?? body?.error ?? `Vision API failed with status ${response.status}`)
     }
 
     const body = (await response.json()) as ReadPassResponse

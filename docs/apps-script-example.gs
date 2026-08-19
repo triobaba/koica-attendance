@@ -80,7 +80,9 @@ function handleAttendance(body) {
   }
 
   const lock = LockService.getScriptLock()
-  lock.waitLock(5000)
+  if (!lock.tryLock(15000)) {
+    return jsonResponse({ ok: false, error: 'busy_retry' })
+  }
   try {
     migrateLegacySheet()
     const programme = findProgramme(body.sessionCode) || {
@@ -319,7 +321,9 @@ function setPin(body) {
     return jsonResponse({ ok: false, error: 'missing_pin' })
   }
   const lock = LockService.getScriptLock()
-  lock.waitLock(5000)
+  if (!lock.tryLock(15000)) {
+    return jsonResponse({ ok: false, error: 'busy_retry' })
+  }
   try {
     const sheet = ensurePinSheet()
     const lastRow = Math.max(sheet.getLastRow(), 1)

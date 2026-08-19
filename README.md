@@ -2,7 +2,7 @@
 
 Browser self check-in for KOICA Youth Leaders Program:
 
-- scan pass card with camera (Gemini vision)
+- scan pass card with camera (Claude vision)
 - extract and confirm `programId`, `fullName`, `country` (scan only — no typed fields except the PIN)
 - mark Present for the **current programme** from the [KOICA Ghana itinerary](https://serene-sawine-f5fe79.netlify.app/) (one Present per person per programme; meals are skipped)
 - queue writes offline and auto-sync when network returns
@@ -10,7 +10,7 @@ Browser self check-in for KOICA Youth Leaders Program:
 ## Stack
 
 - Frontend: React + TypeScript + Vite
-- OCR endpoint: `api/read-pass.ts` (Gemini)
+- OCR endpoint: `api/read-pass.ts` (Claude)
 - Sheet write endpoint: `api/mark-attendance.ts` (proxy to Apps Script)
 
 ## Setup
@@ -29,7 +29,7 @@ cp .env.example .env
 
 3. Set `.env` values:
    - `VITE_PROGRAM_PIN`
-   - `GEMINI_API_KEY`
+   - `ANTHROPIC_API_KEY`
    - `GOOGLE_APPS_SCRIPT_URL`
    - `GOOGLE_APPS_SCRIPT_SHARED_SECRET`
 

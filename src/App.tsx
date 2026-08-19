@@ -1,15 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { StaffPanel } from './StaffPanel'
 import { config } from './config'
+import {
+  enqueueAttendance,
+  flushAttendanceQueue,
+  listQueuedAttendance,
+} from './lib/attendanceQueue'
 import { unlockCheckIn, warmCheckInAccess } from './lib/checkinAccess'
 import { getCheckInLocation } from './lib/geolocation'
 import { isValidProgramId, normalizeProgramId } from './lib/programId'
-import { readPassFromImage } from './lib/readPass'
+import { PassReadRateLimitError, readPassFromImage } from './lib/readPass'
 import { submitToGoogleSheet } from './lib/sheetAttendance'
 import { formatProgrammeWindow, getCheckInProgramme, getNextProgramme } from './schedule'
 import type { OfflineCheckIn } from './types'
-
-type QueueItem = OfflineCheckIn & { id: number }
 
 type ScannedPass = {
   programId: string
@@ -23,22 +26,7 @@ type FlowOutcome = {
   detail: string
 }
 
-const QUEUE_KEY = 'kylp-offline-queue'
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-
-const listQueuedItems = (): QueueItem[] => {
-  const raw = window.localStorage.getItem(QUEUE_KEY)
-  if (!raw) return []
-  try {
-    return JSON.parse(raw) as QueueItem[]
-  } catch {
-    return []
-  }
-}
-
-const saveQueuedItems = (items: QueueItem[]): void => {
-  window.localStorage.setItem(QUEUE_KEY, JSON.stringify(items))
-}
 
 const CHECKED_IN_KEY = 'kylp-checked-in'
 
@@ -178,7 +166,7 @@ function App() {
   }, [])
 
   useEffect(() => {
-    setPendingQueueCount(listQueuedItems().length)
+    setPendingQueueCount(listQueuedAttendance().length)
   }, [])
 
   useEffect(() => {
@@ -207,21 +195,26 @@ function App() {
   }, [])
 
   useEffect(() => {
+    let cancelled = false
+
     const flushQueue = async (): Promise<void> => {
       if (!isOnline) return
-      const queued = listQueuedItems()
-      const remaining: QueueItem[] = []
-      for (const item of queued) {
-        try {
-          await submitToGoogleSheet(item)
-        } catch {
-          remaining.push(item)
-        }
-      }
-      saveQueuedItems(remaining)
-      setPendingQueueCount(remaining.length)
+      const result = await flushAttendanceQueue(submitToGoogleSheet)
+      if (!cancelled) setPendingQueueCount(result.remaining)
     }
+
     void flushQueue()
+    const timer = window.setInterval(() => void flushQueue(), 3_000)
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void flushQueue()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [isOnline])
 
   useEffect(() => {
@@ -300,14 +293,18 @@ function App() {
         } catch (error) {
           if (cancelled) return
           const message = error instanceof Error ? error.message : 'Scan failed'
-          if (message === 'NO_ID') {
+          if (error instanceof PassReadRateLimitError) {
+            setStatusKind('info')
+            setStatusMessage('Vision service is busy. Retrying automatically...')
+            await sleep(error.retryAfterMs)
+          } else if (message === 'NO_ID') {
             setStatusKind('info')
             setStatusMessage('Hold your pass steady in the frame.')
-            await sleep(450)
+            await sleep(1_200)
           } else {
             setStatusKind('error')
             setStatusMessage(message)
-            await sleep(1200)
+            await sleep(2_000)
           }
         } finally {
           readingRef.current = false
@@ -338,11 +335,9 @@ function App() {
   }, [isAdminRoute, checkInUnlocked, activeProgramme?.code, flowHalted])
 
   const queueCheckIn = (payload: OfflineCheckIn) => {
-    const queued = listQueuedItems()
-    const duplicateQueued = queued.some(
-      (item) => item.programId === payload.programId && item.sessionCode === payload.sessionCode,
-    )
-    if (duplicateQueued) {
+    const result = enqueueAttendance(payload)
+    setPendingQueueCount(result.count)
+    if (!result.added) {
       finishWith({
         kind: 'duplicate',
         title: 'Already checked in',
@@ -350,10 +345,6 @@ function App() {
       })
       return
     }
-    const next: QueueItem = { ...payload, id: Date.now() }
-    const updated = [...queued, next]
-    saveQueuedItems(updated)
-    setPendingQueueCount(updated.length)
     rememberCheckedIn(payload.sessionCode, payload.programId)
     finishWith({
       kind: 'queued',

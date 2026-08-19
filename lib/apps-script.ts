@@ -100,8 +100,12 @@ export const callAppsScript = async (payload: Record<string, unknown>): Promise<
   return parseJsonObject(raw)
 }
 
-export const jsonResponse = (body: unknown, status = 200): Response =>
+export const jsonResponse = (
+  body: unknown,
+  status = 200,
+  headers: Record<string, string> = {},
+): Response =>
   new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...headers },
   })

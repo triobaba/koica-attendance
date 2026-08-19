@@ -18,6 +18,8 @@ const VERIFY_TTL_MS = 60 * 1000
 
 let pinSupport: { supported: boolean; checkedAt: number } | null = null
 const verifyCache = new Map<string, { granted: boolean; expiresAt: number }>()
+const inFlightVerifications = new Map<string, Promise<boolean>>()
+let capabilityProbe: Promise<void> | null = null
 
 const capabilityIsFresh = (): boolean =>
   pinSupport !== null && Date.now() - pinSupport.checkedAt < CAPABILITY_TTL_MS
@@ -43,10 +45,22 @@ const probeAppsScript = async (): Promise<void> => {
   rememberCapability(result.error)
 }
 
+const ensurePinCapability = async (): Promise<void> => {
+  if (capabilityIsFresh()) return
+  if (!capabilityProbe) {
+    capabilityProbe = probeAppsScript().finally(() => {
+      capabilityProbe = null
+    })
+  }
+  await capabilityProbe
+}
+
 const resolveUnlock = async (pin: string, sessionCode: string): Promise<boolean> => {
+  await ensurePinCapability()
+
   // A deployment without verifyPin can only ever be judged against the default
   // PIN locally, so skip the round trip whose answer we would discard anyway.
-  if (capabilityIsFresh() && pinSupport?.supported === false) {
+  if (pinSupport?.supported === false) {
     return pin === defaultProgramPin()
   }
 
@@ -56,18 +70,27 @@ const resolveUnlock = async (pin: string, sessionCode: string): Promise<boolean>
     return cached.granted
   }
 
-  const result = await callAppsScript({
-    action: 'verifyPin',
-    pin,
-    sessionCode,
-    defaultPin: defaultProgramPin(),
-  })
-  rememberCapability(result.error)
+  const existing = inFlightVerifications.get(cacheKey)
+  if (existing) return existing
 
-  const granted =
-    result.ok === true || (!scriptSupportsPins(result.error) && pin === defaultProgramPin())
-  verifyCache.set(cacheKey, { granted, expiresAt: Date.now() + VERIFY_TTL_MS })
-  return granted
+  const verification = (async () => {
+    const result = await callAppsScript({
+      action: 'verifyPin',
+      pin,
+      sessionCode,
+      defaultPin: defaultProgramPin(),
+    })
+    rememberCapability(result.error)
+
+    const granted =
+      result.ok === true || (!scriptSupportsPins(result.error) && pin === defaultProgramPin())
+    verifyCache.set(cacheKey, { granted, expiresAt: Date.now() + VERIFY_TTL_MS })
+    return granted
+  })().finally(() => {
+    inFlightVerifications.delete(cacheKey)
+  })
+  inFlightVerifications.set(cacheKey, verification)
+  return verification
 }
 
 async function handler(request: Request): Promise<Response> {
@@ -89,9 +112,7 @@ async function handler(request: Request): Promise<Response> {
 
   try {
     if (body.action === 'warm') {
-      if (!capabilityIsFresh()) {
-        await probeAppsScript()
-      }
+      await ensurePinCapability()
       return jsonResponse({ ok: true })
     }
 

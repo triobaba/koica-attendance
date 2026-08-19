@@ -41,6 +41,13 @@ async function handler(request: Request): Promise<Response> {
       checkedInAt: new Date().toISOString(),
     })
     if (parsed.ok === false) {
+      if (parsed.error === 'busy_retry') {
+        return jsonResponse(
+          { error: 'Attendance service is busy. Retrying automatically.' },
+          503,
+          { 'Retry-After': '3' },
+        )
+      }
       const status = parsed.error === 'unauthorized' ? 401 : 502
       return jsonResponse({ error: parsed.error ?? 'Apps Script rejected the write' }, status)
     }

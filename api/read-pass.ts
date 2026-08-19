@@ -7,13 +7,6 @@ type ParsedPass = {
   confidence: number
 }
 
-type GeminiOptions = {
-  model: string
-  jsonMode: boolean
-  thinkingLevel?: 'minimal' | 'low'
-  mediaResolution?: 'MEDIA_RESOLUTION_LOW'
-}
-
 const defaultResponse: ParsedPass = {
   programId: '',
   fullName: '',
@@ -21,11 +14,11 @@ const defaultResponse: ParsedPass = {
   confidence: 0,
 }
 
-const FALLBACK_MODELS = ['gemini-3.1-flash-lite', 'gemini-2.0-flash']
-const GEMINI_TIMEOUT_MS = 4600
+const FALLBACK_MODELS = ['claude-haiku-4-5', 'claude-haiku-4-5-20251001', 'claude-3-5-haiku-latest']
+const CLAUDE_TIMEOUT_MS = 4600
 const REQUEST_DEADLINE_MS = 4800
 
-let cachedOptions: GeminiOptions | null = null
+let cachedModel: string | null = null
 
 const parseJsonObject = (value: string): ParsedPass => {
   const withoutFence = value.replace(/```json|```/gi, '').trim()
@@ -47,54 +40,51 @@ const parseJsonObject = (value: string): ParsedPass => {
   }
 }
 
-const callGemini = async (
+const modelAttempts = (requestedModel: string): string[] => {
+  const models = [requestedModel, ...FALLBACK_MODELS.filter((model) => model !== requestedModel)]
+  return cachedModel ? [cachedModel, ...models.filter((model) => model !== cachedModel)] : models
+}
+
+const callClaude = async (
   apiKey: string,
   imageBase64: string,
   prompt: string,
-  options: GeminiOptions,
+  model: string,
   timeoutMs: number,
 ): Promise<Response> => {
-  const generationConfig: Record<string, unknown> = {
-    temperature: 0,
-    maxOutputTokens: 96,
-  }
-  if (options.jsonMode) {
-    generationConfig.responseMimeType = 'application/json'
-  }
-  if (options.thinkingLevel) {
-    generationConfig.thinkingConfig = { thinkingLevel: options.thinkingLevel }
-  }
-  if (options.mediaResolution) {
-    generationConfig.mediaResolution = options.mediaResolution
-  }
-
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    return await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${options.model}:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                { text: prompt },
-                {
-                  inlineData: {
-                    mimeType: 'image/jpeg',
-                    data: imageBase64,
-                  },
-                },
-              ],
-            },
-          ],
-          generationConfig,
-        }),
+    return await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
       },
-    )
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        max_tokens: 96,
+        temperature: 0,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image',
+                source: {
+                  type: 'base64',
+                  media_type: 'image/jpeg',
+                  data: imageBase64,
+                },
+              },
+              { type: 'text', text: prompt },
+            ],
+          },
+        ],
+      }),
+    })
   } catch (error) {
     if (controller.signal.aborted) {
       const timeout = new Error('Vision timed out')
@@ -107,18 +97,15 @@ const callGemini = async (
   }
 }
 
-const optionAttempts = (requestedModel: string): GeminiOptions[] => {
-  const models = [requestedModel, ...FALLBACK_MODELS.filter((model) => model !== requestedModel)]
-  return models.flatMap((model) => [
-    { model, jsonMode: true, thinkingLevel: 'minimal' },
-    { model, jsonMode: true },
-  ])
-}
-
-const jsonError = (error: string, details?: string, status = 502): Response =>
+const jsonError = (
+  error: string,
+  details?: string,
+  status = 502,
+  headers: Record<string, string> = {},
+): Response =>
   new Response(JSON.stringify({ error, details }), {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...headers },
   })
 
 async function handler(request: Request): Promise<Response> {
@@ -126,9 +113,9 @@ async function handler(request: Request): Promise<Response> {
     return jsonError('Method not allowed', undefined, 405)
   }
 
-  const apiKey = serverEnv('GEMINI_API_KEY')
+  const apiKey = serverEnv('ANTHROPIC_API_KEY')
   if (!apiKey) {
-    return jsonError('GEMINI_API_KEY is missing', undefined, 500)
+    return jsonError('ANTHROPIC_API_KEY is missing', undefined, 500)
   }
 
   let imageBase64 = ''
@@ -143,41 +130,47 @@ async function handler(request: Request): Promise<Response> {
     return jsonError('imageBase64 is required', undefined, 400)
   }
 
-  const requestedModel = serverEnv('GEMINI_MODEL', 'gemini-3.1-flash-lite')
+  const requestedModel = serverEnv('CLAUDE_MODEL', 'claude-haiku-4-5')
   const prompt =
     'Read this KOICA Youth Leaders pass. Return JSON only: {"programId":"KYLP000","fullName":"","country":"","confidence":0}. programId must match KYLP plus digits or be empty. Do not guess an ID.'
 
-  const attempts = cachedOptions ? [cachedOptions] : optionAttempts(requestedModel)
   const deadline = Date.now() + REQUEST_DEADLINE_MS
-  let geminiResponse: Response | null = null
+  let claudeResponse: Response | null = null
   let lastDetails = ''
-  let usedOptions: GeminiOptions | null = null
+  let usedModel: string | null = null
 
-  for (const options of attempts) {
+  for (const model of modelAttempts(requestedModel)) {
     const remaining = deadline - Date.now()
     if (remaining < 250) break
     try {
-      const response = await callGemini(
+      const response = await callClaude(
         apiKey,
         imageBase64,
         prompt,
-        options,
-        Math.min(GEMINI_TIMEOUT_MS, remaining),
+        model,
+        Math.min(CLAUDE_TIMEOUT_MS, remaining),
       )
       if (response.ok) {
-        geminiResponse = response
-        usedOptions = options
-        cachedOptions = options
+        claudeResponse = response
+        usedModel = model
+        cachedModel = model
         break
       }
       lastDetails = await response.text()
-      cachedOptions = null
+      cachedModel = null
       if (response.status === 404) {
         continue
       }
-      if (response.status !== 400) {
-        return jsonError('Vision model request failed', lastDetails)
+      if (response.status === 429 || response.status === 529) {
+        const retryAfter = response.headers.get('retry-after') ?? '2'
+        return jsonError(
+          'Vision service is busy. Retrying automatically.',
+          lastDetails,
+          429,
+          { 'Retry-After': retryAfter },
+        )
       }
+      return jsonError('Vision model request failed', lastDetails)
     } catch (error) {
       const aborted = error instanceof Error && error.name === 'AbortError'
       lastDetails = aborted
@@ -185,7 +178,7 @@ async function handler(request: Request): Promise<Response> {
         : error instanceof Error
           ? error.message
           : String(error)
-      cachedOptions = null
+      cachedModel = null
       if (aborted) {
         return new Response(JSON.stringify({ pass: defaultResponse, rawText: '' }), {
           status: 200,
@@ -197,17 +190,14 @@ async function handler(request: Request): Promise<Response> {
     }
   }
 
-  if (!geminiResponse?.ok || !usedOptions) {
+  if (!claudeResponse?.ok || !usedModel) {
     return jsonError('Vision model request failed', lastDetails || 'No vision model accepted the request')
   }
 
-  const geminiBody = (await geminiResponse.json()) as {
-    candidates?: Array<{
-      content?: { parts?: Array<{ text?: string }> }
-    }>
+  const claudeBody = (await claudeResponse.json()) as {
+    content?: Array<{ type?: string; text?: string }>
   }
-
-  const rawText = geminiBody.candidates?.[0]?.content?.parts?.[0]?.text ?? ''
+  const rawText = claudeBody.content?.find((part) => part.type === 'text')?.text ?? ''
   const parsed = parseJsonObject(rawText)
 
   return new Response(JSON.stringify({ pass: parsed, rawText }), {
