@@ -154,6 +154,48 @@ p {
   color: #6ee7b7;
 }
 
+.processing-card,
+.retry-card {
+  text-align: center;
+}
+
+.processing-preview {
+  width: 100%;
+  max-height: 46dvh;
+  object-fit: cover;
+  border-radius: 0.75rem;
+  border: 1px solid #d1d5db;
+}
+
+.processing-preview-empty {
+  background: #e5e7eb;
+  min-height: 220px;
+}
+
+.processing-copy {
+  display: grid;
+  gap: 0.45rem;
+  justify-items: center;
+}
+
+.spinner {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  border: 3px solid #99f6e4;
+  border-top-color: #0f766e;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .action-bar {
   display: grid;
   gap: 0.6rem;

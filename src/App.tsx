@@ -6,6 +6,7 @@ import {
   flushAttendanceQueue,
   listQueuedAttendance,
 } from './lib/attendanceQueue'
+import { waitForStableFrame } from './lib/autoCapture'
 import { unlockCheckIn, warmCheckInAccess } from './lib/checkinAccess'
 import { getCheckInLocation } from './lib/geolocation'
 import { isValidProgramId, normalizeProgramId } from './lib/programId'
@@ -25,6 +26,8 @@ type FlowOutcome = {
   title: string
   detail: string
 }
+
+type ScanPhase = 'aligning' | 'processing' | 'retryPrompt'
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -63,7 +66,7 @@ const currentPath = (): string => {
   return path === '' ? '/' : path
 }
 
-const captureJpegBase64 = (video: HTMLVideoElement): string => {
+const captureJpeg = (video: HTMLVideoElement): { base64: string; dataUrl: string } => {
   const naturalWidth = video.videoWidth
   const naturalHeight = video.videoHeight
   if (naturalWidth < 16 || naturalHeight < 16) {
@@ -80,7 +83,8 @@ const captureJpegBase64 = (video: HTMLVideoElement): string => {
     throw new Error('Could not read camera frame')
   }
   context.drawImage(video, 0, 0, outputWidth, outputHeight)
-  return canvas.toDataURL('image/jpeg', 0.55).split(',')[1] ?? ''
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.55)
+  return { dataUrl, base64: dataUrl.split(',')[1] ?? '' }
 }
 
 function App() {
@@ -92,10 +96,13 @@ function App() {
 
   const [statusMessage, setStatusMessage] = useState('Hold your pass in the frame. Scanning starts automatically.')
   const [statusKind, setStatusKind] = useState<'info' | 'error' | 'success'>('info')
-  const [isReading, setIsReading] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [scanned, setScanned] = useState<ScannedPass | null>(null)
   const [outcome, setOutcome] = useState<FlowOutcome | null>(null)
+  const [scanPhase, setScanPhase] = useState<ScanPhase>('aligning')
+  const [scanFailures, setScanFailures] = useState(0)
+  const [capturedPreview, setCapturedPreview] = useState<string | null>(null)
+  const [scanCycle, setScanCycle] = useState(0)
   const [pendingQueueCount, setPendingQueueCount] = useState(0)
 
   const [now, setNow] = useState(() => new Date())
@@ -104,7 +111,7 @@ function App() {
   const streamRef = useRef<MediaStream | null>(null)
   const scannedRef = useRef<ScannedPass | null>(null)
   const submittingRef = useRef(false)
-  const readingRef = useRef(false)
+  const scanFailuresRef = useRef(0)
   const activeProgramme = useMemo(
     () =>
       getCheckInProgramme(now, {
@@ -122,6 +129,11 @@ function App() {
     submittingRef.current = false
     setScanned(null)
     setOutcome(null)
+    setScanPhase('aligning')
+    setScanFailures(0)
+    scanFailuresRef.current = 0
+    setCapturedPreview(null)
+    setScanCycle((value) => value + 1)
     setIsSubmitting(false)
     setCheckInUnlocked(false)
     setProgramPinInput('')
@@ -132,8 +144,13 @@ function App() {
   const rescan = () => {
     scannedRef.current = null
     setScanned(null)
+    setScanPhase('aligning')
+    setScanFailures(0)
+    scanFailuresRef.current = 0
+    setCapturedPreview(null)
+    setScanCycle((value) => value + 1)
     setStatusKind('info')
-    setStatusMessage('Hold your pass in the frame. Scanning starts automatically.')
+    setStatusMessage('Hold your pass inside the frame. Capturing automatically...')
   }
 
   // Every terminal state, good or bad, parks on a message and then hands the
@@ -147,6 +164,10 @@ function App() {
   useEffect(() => {
     scannedRef.current = scanned
   }, [scanned])
+
+  useEffect(() => {
+    scanFailuresRef.current = scanFailures
+  }, [scanFailures])
 
   useEffect(() => {
     submittingRef.current = isSubmitting
@@ -227,6 +248,13 @@ function App() {
 
     let cancelled = false
     const abortReads = new AbortController()
+    let failedReads = scanFailuresRef.current
+
+    const stopCamera = () => {
+      streamRef.current?.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+      if (videoRef.current) videoRef.current.srcObject = null
+    }
 
     const startCamera = async () => {
       if (streamRef.current) return
@@ -247,92 +275,145 @@ function App() {
       }
     }
 
-    const loop = async () => {
-      setStatusKind('info')
-      setStatusMessage('Hold your pass in the frame. Scanning starts automatically.')
+    const processCapturedImage = async (
+      imageBase64: string,
+    ): Promise<{ kind: 'pass'; pass: ScannedPass } | { kind: 'no_id' }> => {
       while (!cancelled) {
-        if (scannedRef.current || submittingRef.current || readingRef.current) {
+        try {
+          const result = await readPassFromImage(imageBase64, {
+            timeoutMs: 5000,
+            signal: abortReads.signal,
+          })
+          const pass = {
+            programId: normalizeProgramId(result.pass.programId),
+            fullName: result.pass.fullName,
+            country: result.pass.country,
+          }
+          return { kind: 'pass', pass }
+        } catch (error) {
+          if (cancelled) return { kind: 'no_id' }
+          const message = error instanceof Error ? error.message : 'Scan failed'
+          if (error instanceof PassReadRateLimitError) {
+            setStatusKind('info')
+            setStatusMessage('Vision service is busy. Retrying automatically...')
+            await sleep(error.retryAfterMs)
+            continue
+          }
+          if (message === 'NO_ID') {
+            return { kind: 'no_id' }
+          }
+          throw error
+        }
+      }
+      return { kind: 'no_id' }
+    }
+
+    const loop = async () => {
+      setScanPhase('aligning')
+      setStatusKind('info')
+      setStatusMessage('Hold your pass inside the frame. Capturing automatically...')
+
+      while (!cancelled) {
+        if (scannedRef.current || submittingRef.current) {
           await sleep(250)
           continue
         }
 
+        await startCamera()
         const video = videoRef.current
         if (!video || video.videoWidth < 16) {
           await sleep(200)
           continue
         }
 
-        readingRef.current = true
-        setIsReading(true)
+        setScanPhase('aligning')
         setStatusKind('info')
-        setStatusMessage('Reading pass...')
+        setStatusMessage('Hold your pass inside the frame. Capturing automatically...')
+        await waitForStableFrame(video, {
+          signal: abortReads.signal,
+          maxWaitMs: 2500,
+        })
+        if (cancelled) return
+
+        const captured = captureJpeg(video)
+        setCapturedPreview(captured.dataUrl)
+        setScanPhase('processing')
+        setStatusKind('info')
+        setStatusMessage('Processing your pass...')
+        stopCamera()
+
         try {
-          const imageBase64 = captureJpegBase64(video)
-          const result = await readPassFromImage(imageBase64, {
-            timeoutMs: 5000,
-            signal: abortReads.signal,
-          })
+          const processed = await processCapturedImage(captured.base64)
           if (cancelled) return
-          const pass = {
-            programId: normalizeProgramId(result.pass.programId),
-            fullName: result.pass.fullName,
-            country: result.pass.country,
-          }
-          if (hasCheckedIn(activeProgramme.code, pass.programId)) {
-            finishWith({
-              kind: 'duplicate',
-              title: 'Already checked in',
-              detail: `${pass.fullName} (${pass.programId}) is already marked present for ${activeProgramme.title}.`,
-            })
+
+          if (processed.kind === 'pass') {
+            const pass = processed.pass
+            if (hasCheckedIn(activeProgramme.code, pass.programId)) {
+              finishWith({
+                kind: 'duplicate',
+                title: 'Already checked in',
+                detail: `${pass.fullName} (${pass.programId}) is already marked present for ${activeProgramme.title}.`,
+              })
+              return
+            }
+            failedReads = 0
+            setScanFailures(0)
+            scanFailuresRef.current = 0
+            scannedRef.current = pass
+            setScanned(pass)
+            setCapturedPreview(null)
+            setStatusKind('success')
+            setStatusMessage('Pass read. Confirm below.')
             return
           }
-          scannedRef.current = pass
-          setScanned(pass)
-          setStatusKind('success')
-          setStatusMessage('Pass read. Confirm below.')
+
+          failedReads += 1
+          setScanFailures(failedReads)
+          scanFailuresRef.current = failedReads
+          setCapturedPreview(null)
+          if (failedReads >= 2) {
+            setScanPhase('retryPrompt')
+            setStatusKind('error')
+            setStatusMessage('We could not read the pass clearly. Tap Try again.')
+            return
+          }
+
+          setScanPhase('aligning')
+          setStatusKind('info')
+          setStatusMessage('Could not read clearly. Repositioning for one more automatic capture...')
+          await sleep(700)
         } catch (error) {
           if (cancelled) return
-          const message = error instanceof Error ? error.message : 'Scan failed'
-          if (error instanceof PassReadRateLimitError) {
-            setStatusKind('info')
-            setStatusMessage('Vision service is busy. Retrying automatically...')
-            await sleep(error.retryAfterMs)
-          } else if (message === 'NO_ID') {
-            setStatusKind('info')
-            setStatusMessage('Hold your pass steady in the frame.')
-            await sleep(1_200)
-          } else {
-            setStatusKind('error')
-            setStatusMessage(message)
-            await sleep(2_000)
-          }
-        } finally {
-          readingRef.current = false
-          setIsReading(false)
+          setCapturedPreview(null)
+          setStatusKind('error')
+          setStatusMessage(error instanceof Error ? error.message : 'Scan failed')
+          await sleep(2_000)
+          setScanPhase('aligning')
         }
       }
     }
 
-    void startCamera()
-      .then(() => sleep(150))
-      .then(() => loop())
-      .catch((error) => {
-        if (cancelled) return
-        finishWith({
-          kind: 'error',
-          title: 'Camera unavailable',
-          detail: error instanceof Error ? error.message : 'Could not start the camera.',
-        })
+    void loop().catch((error) => {
+      if (cancelled) return
+      finishWith({
+        kind: 'error',
+        title: 'Camera unavailable',
+        detail: error instanceof Error ? error.message : 'Could not start the camera.',
       })
+    })
 
     return () => {
       cancelled = true
       abortReads.abort()
-      streamRef.current?.getTracks().forEach((track) => track.stop())
-      streamRef.current = null
-      if (videoRef.current) videoRef.current.srcObject = null
+      stopCamera()
     }
-  }, [isAdminRoute, checkInUnlocked, activeProgramme?.code, flowHalted])
+  }, [
+    isAdminRoute,
+    checkInUnlocked,
+    activeProgramme,
+    flowHalted,
+    scanCycle,
+  ])
 
   const queueCheckIn = (payload: OfflineCheckIn) => {
     const result = enqueueAttendance(payload)
@@ -358,8 +439,13 @@ function App() {
     try {
       await unlockCheckIn(programPinInput)
       setCheckInUnlocked(true)
+      setScanPhase('aligning')
+      setScanFailures(0)
+      scanFailuresRef.current = 0
+      setCapturedPreview(null)
+      setScanCycle((value) => value + 1)
       setStatusKind('info')
-      setStatusMessage('Hold your pass in the frame. Scanning starts automatically.')
+      setStatusMessage('Hold your pass inside the frame. Capturing automatically...')
     } catch (error) {
       setStatusKind('error')
       setStatusMessage(error instanceof Error ? error.message : 'Incorrect program PIN.')
@@ -541,16 +627,42 @@ function App() {
             {/* Kept mounted while confirming so returning to the camera is instant. */}
             <section className={scanned ? 'step is-hidden' : 'step'} aria-hidden={Boolean(scanned)}>
               <p className="step-label">Step 1 of 2 · Scan</p>
-              <div className="scanner">
-                <video ref={videoRef} playsInline muted />
-                <div className="scan-frame" aria-hidden="true" />
-                <div className="scan-hud">
-                  <p className="scan-hint">
-                    {isReading ? 'Reading pass...' : 'Hold your pass inside the frame'}
-                  </p>
-                  <p className={`scan-status ${statusKind}`}>{statusMessage}</p>
+              {scanPhase === 'aligning' && (
+                <div className="scanner">
+                  <video ref={videoRef} playsInline muted />
+                  <div className="scan-frame" aria-hidden="true" />
+                  <div className="scan-hud">
+                    <p className="scan-hint">Hold your pass inside the frame</p>
+                    <p className={`scan-status ${statusKind}`}>{statusMessage}</p>
+                  </div>
                 </div>
-              </div>
+              )}
+              {scanPhase === 'processing' && (
+                <article className="card processing-card">
+                  {capturedPreview ? (
+                    <img className="processing-preview" src={capturedPreview} alt="Captured pass preview" />
+                  ) : (
+                    <div className="processing-preview processing-preview-empty" aria-hidden="true" />
+                  )}
+                  <div className="processing-copy">
+                    <h2>Processing pass</h2>
+                    <p className="info">{statusMessage}</p>
+                    <div className="spinner" aria-hidden="true" />
+                  </div>
+                </article>
+              )}
+              {scanPhase === 'retryPrompt' && (
+                <article className="card retry-card">
+                  <h2>Could not read pass</h2>
+                  <p>{statusMessage}</p>
+                  <p className="muted">
+                    We automatically tried twice. Hold the pass flatter and try again.
+                  </p>
+                  <button type="button" className="primary-action" onClick={rescan}>
+                    Try again
+                  </button>
+                </article>
+              )}
               {!isOnline && <p className="warning">Offline: check-ins queue and sync later.</p>}
               {pendingQueueCount > 0 && (
                 <p className="warning">{pendingQueueCount} queued check-ins pending sync.</p>
