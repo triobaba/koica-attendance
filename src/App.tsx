@@ -26,8 +26,6 @@ type FlowOutcome = {
   detail: string
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-
 const CHECKED_IN_KEY = 'kylp-checked-in'
 
 // Passes already marked present, grouped by programme, so a pass that is still
@@ -90,11 +88,14 @@ function App() {
   const [isUnlocking, setIsUnlocking] = useState(false)
   const isAdminRoute = path === ADMIN_PATH
 
-  const [statusMessage, setStatusMessage] = useState('Hold your pass in the frame. Scanning starts automatically.')
+  const [statusMessage, setStatusMessage] = useState(
+    'Hold your pass in the frame, then tap Capture pass.',
+  )
   const [statusKind, setStatusKind] = useState<'info' | 'error' | 'success'>('info')
   const [isReading, setIsReading] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [scanned, setScanned] = useState<ScannedPass | null>(null)
+  const [ocrPass, setOcrPass] = useState<ScannedPass | null>(null)
   const [outcome, setOutcome] = useState<FlowOutcome | null>(null)
   const [pendingQueueCount, setPendingQueueCount] = useState(0)
 
@@ -103,8 +104,6 @@ function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const scannedRef = useRef<ScannedPass | null>(null)
-  const submittingRef = useRef(false)
-  const readingRef = useRef(false)
   const activeProgramme = useMemo(
     () =>
       getCheckInProgramme(now, {
@@ -119,21 +118,22 @@ function App() {
 
   const resetToHome = () => {
     scannedRef.current = null
-    submittingRef.current = false
     setScanned(null)
+    setOcrPass(null)
     setOutcome(null)
     setIsSubmitting(false)
     setCheckInUnlocked(false)
     setProgramPinInput('')
     setStatusKind('info')
-    setStatusMessage('Hold your pass in the frame. Scanning starts automatically.')
+    setStatusMessage('Hold your pass in the frame, then tap Capture pass.')
   }
 
   const rescan = () => {
     scannedRef.current = null
     setScanned(null)
+    setOcrPass(null)
     setStatusKind('info')
-    setStatusMessage('Hold your pass in the frame. Scanning starts automatically.')
+    setStatusMessage('Hold your pass in the frame, then tap Capture pass.')
   }
 
   // Every terminal state, good or bad, parks on a message and then hands the
@@ -147,10 +147,6 @@ function App() {
   useEffect(() => {
     scannedRef.current = scanned
   }, [scanned])
-
-  useEffect(() => {
-    submittingRef.current = isSubmitting
-  }, [isSubmitting])
 
   useEffect(() => {
     const onOnline = () => setIsOnline(true)
@@ -225,8 +221,7 @@ function App() {
       return
     }
 
-    let cancelled = false
-    const abortReads = new AbortController()
+    const videoElement = videoRef.current
 
     const startCamera = async () => {
       if (streamRef.current) return
@@ -235,89 +230,19 @@ function App() {
         audio: false,
       })
       streamRef.current = stream
-      const video = videoRef.current
-      if (video) {
-        video.srcObject = stream
-        await video.play()
-        if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      if (videoElement) {
+        videoElement.srcObject = stream
+        await videoElement.play()
+        if (videoElement.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
           await new Promise<void>((resolve) => {
-            video.addEventListener('loadeddata', () => resolve(), { once: true })
+            videoElement.addEventListener('loadeddata', () => resolve(), { once: true })
           })
-        }
-      }
-    }
-
-    const loop = async () => {
-      setStatusKind('info')
-      setStatusMessage('Hold your pass in the frame. Scanning starts automatically.')
-      while (!cancelled) {
-        if (scannedRef.current || submittingRef.current || readingRef.current) {
-          await sleep(250)
-          continue
-        }
-
-        const video = videoRef.current
-        if (!video || video.videoWidth < 16) {
-          await sleep(200)
-          continue
-        }
-
-        readingRef.current = true
-        setIsReading(true)
-        setStatusKind('info')
-        setStatusMessage('Reading pass...')
-        try {
-          const imageBase64 = captureJpegBase64(video)
-          const result = await readPassFromImage(imageBase64, {
-            timeoutMs: 5000,
-            signal: abortReads.signal,
-          })
-          if (cancelled) return
-          const pass = {
-            programId: normalizeProgramId(result.pass.programId),
-            fullName: result.pass.fullName,
-            country: result.pass.country,
-          }
-          if (hasCheckedIn(activeProgramme.code, pass.programId)) {
-            finishWith({
-              kind: 'duplicate',
-              title: 'Already checked in',
-              detail: `${pass.fullName} (${pass.programId}) is already marked present for ${activeProgramme.title}.`,
-            })
-            return
-          }
-          scannedRef.current = pass
-          setScanned(pass)
-          setStatusKind('success')
-          setStatusMessage('Pass read. Confirm below.')
-        } catch (error) {
-          if (cancelled) return
-          const message = error instanceof Error ? error.message : 'Scan failed'
-          if (error instanceof PassReadRateLimitError) {
-            setStatusKind('info')
-            setStatusMessage('Vision service is busy. Retrying automatically...')
-            await sleep(error.retryAfterMs)
-          } else if (message === 'NO_ID') {
-            setStatusKind('info')
-            setStatusMessage('Hold your pass steady in the frame.')
-            await sleep(1_200)
-          } else {
-            setStatusKind('error')
-            setStatusMessage(message)
-            await sleep(2_000)
-          }
-        } finally {
-          readingRef.current = false
-          setIsReading(false)
         }
       }
     }
 
     void startCamera()
-      .then(() => sleep(150))
-      .then(() => loop())
       .catch((error) => {
-        if (cancelled) return
         finishWith({
           kind: 'error',
           title: 'Camera unavailable',
@@ -326,13 +251,62 @@ function App() {
       })
 
     return () => {
-      cancelled = true
-      abortReads.abort()
       streamRef.current?.getTracks().forEach((track) => track.stop())
       streamRef.current = null
-      if (videoRef.current) videoRef.current.srcObject = null
+      if (videoElement) videoElement.srcObject = null
     }
-  }, [isAdminRoute, checkInUnlocked, activeProgramme?.code, flowHalted])
+  }, [isAdminRoute, checkInUnlocked, activeProgramme, flowHalted])
+
+  const handleCapturePass = async () => {
+    if (!activeProgramme || isReading || isSubmitting || scannedRef.current) return
+
+    const video = videoRef.current
+    if (!video || video.videoWidth < 16) {
+      setStatusKind('error')
+      setStatusMessage('Camera is not ready yet. Please wait and try again.')
+      return
+    }
+
+    setIsReading(true)
+    setStatusKind('info')
+    setStatusMessage('Reading pass...')
+    try {
+      const imageBase64 = captureJpegBase64(video)
+      const result = await readPassFromImage(imageBase64, { timeoutMs: 5000 })
+      const pass = {
+        programId: normalizeProgramId(result.pass.programId),
+        fullName: result.pass.fullName,
+        country: result.pass.country,
+      }
+      if (hasCheckedIn(activeProgramme.code, pass.programId)) {
+        finishWith({
+          kind: 'duplicate',
+          title: 'Already checked in',
+          detail: `${pass.fullName} (${pass.programId}) is already marked present for ${activeProgramme.title}.`,
+        })
+        return
+      }
+      scannedRef.current = pass
+      setScanned(pass)
+      setOcrPass(pass)
+      setStatusKind('success')
+      setStatusMessage('Pass read. Confirm or edit below before submit.')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Scan failed'
+      if (error instanceof PassReadRateLimitError) {
+        setStatusKind('info')
+        setStatusMessage('Vision service is busy. Please tap Capture pass again in a moment.')
+      } else if (message === 'NO_ID') {
+        setStatusKind('error')
+        setStatusMessage('No pass data found. Reposition the pass and tap Capture pass again.')
+      } else {
+        setStatusKind('error')
+        setStatusMessage(message)
+      }
+    } finally {
+      setIsReading(false)
+    }
+  }
 
   const queueCheckIn = (payload: OfflineCheckIn) => {
     const result = enqueueAttendance(payload)
@@ -359,7 +333,7 @@ function App() {
       await unlockCheckIn(programPinInput)
       setCheckInUnlocked(true)
       setStatusKind('info')
-      setStatusMessage('Hold your pass in the frame. Scanning starts automatically.')
+      setStatusMessage('Hold your pass in the frame, then tap Capture pass.')
     } catch (error) {
       setStatusKind('error')
       setStatusMessage(error instanceof Error ? error.message : 'Incorrect program PIN.')
@@ -399,6 +373,12 @@ function App() {
       return
     }
 
+    const normalizedOcrId = ocrPass ? normalizeProgramId(ocrPass.programId) : normalizedId
+    const editedBeforeConfirm =
+      fullName !== (ocrPass?.fullName.trim() ?? fullName) ||
+      country !== (ocrPass?.country.trim() ?? country) ||
+      normalizedId !== normalizedOcrId
+
     setIsSubmitting(true)
     setStatusKind('info')
     setStatusMessage('Capturing check-in location...')
@@ -422,7 +402,7 @@ function App() {
       sessionLabel: activeProgramme.title,
       programmeWindow: formatProgrammeWindow(activeProgramme),
       source: 'vision',
-      editedBeforeConfirm: false,
+      editedBeforeConfirm,
       ...location,
     }
 
@@ -546,11 +526,19 @@ function App() {
                 <div className="scan-frame" aria-hidden="true" />
                 <div className="scan-hud">
                   <p className="scan-hint">
-                    {isReading ? 'Reading pass...' : 'Hold your pass inside the frame'}
+                    {isReading ? 'Reading pass...' : 'Align pass, then tap Capture pass'}
                   </p>
                   <p className={`scan-status ${statusKind}`}>{statusMessage}</p>
                 </div>
               </div>
+              <button
+                type="button"
+                className="primary-action"
+                onClick={() => void handleCapturePass()}
+                disabled={isReading || isSubmitting}
+              >
+                {isReading ? 'Reading...' : 'Capture pass'}
+              </button>
               {!isOnline && <p className="warning">Offline: check-ins queue and sync later.</p>}
               {pendingQueueCount > 0 && (
                 <p className="warning">{pendingQueueCount} queued check-ins pending sync.</p>
@@ -565,15 +553,56 @@ function App() {
                   <dl className="readout">
                     <div>
                       <dt>Full Name</dt>
-                      <dd className="readout-lead">{scanned.fullName}</dd>
+                      <dd>
+                        <input
+                          className="readout-input readout-lead"
+                          value={scanned.fullName}
+                          onChange={(event) =>
+                            setScanned((previous) =>
+                              previous ? { ...previous, fullName: event.target.value } : previous,
+                            )
+                          }
+                          disabled={isSubmitting}
+                        />
+                      </dd>
                     </div>
                     <div>
                       <dt>Program ID</dt>
-                      <dd>{scanned.programId}</dd>
+                      <dd>
+                        <input
+                          className="readout-input"
+                          value={scanned.programId}
+                          autoCapitalize="characters"
+                          autoCorrect="off"
+                          spellCheck={false}
+                          onChange={(event) =>
+                            setScanned((previous) =>
+                              previous
+                                ? {
+                                    ...previous,
+                                    programId: normalizeProgramId(event.target.value),
+                                  }
+                                : previous,
+                            )
+                          }
+                          disabled={isSubmitting}
+                        />
+                      </dd>
                     </div>
                     <div>
                       <dt>Country</dt>
-                      <dd>{scanned.country}</dd>
+                      <dd>
+                        <input
+                          className="readout-input"
+                          value={scanned.country}
+                          onChange={(event) =>
+                            setScanned((previous) =>
+                              previous ? { ...previous, country: event.target.value } : previous,
+                            )
+                          }
+                          disabled={isSubmitting}
+                        />
+                      </dd>
                     </div>
                     <div>
                       <dt>Programme</dt>
